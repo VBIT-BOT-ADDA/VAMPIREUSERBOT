@@ -1,8 +1,8 @@
 {
-  "name": "telegram userbot host bot",
-  "description": "a telegram bot to host userbots securely with session generation.",
-  "repository": "https://github.com/your-username/your-repo",
-  "keywords": ["telegram", "userbot", "hosting", "telethon"],
+  "name": "vampire userbot host bot",
+  "description": "a telegram bot to host userbots securely with mongodb database support.",
+  "repository": "https://github.com/VBIT-BOT-ADDA/VAMPIREUSERBOT",
+  "keywords": ["telegram", "userbot", "hosting", "telethon", "mongodb"],
   "stack": "container",
   "env": {
     "BOT_TOKEN": {
@@ -15,6 +15,10 @@
     },
     "API_HASH": {
       "description": "your telegram api hash from my.telegram.org",
+      "value": ""
+    },
+    "MONGO_DB_URI": {
+      "description": "your mongodb connection string uri",
       "value": ""
     },
     "OWNER_USERNAME": {
@@ -31,7 +35,7 @@
     },
     "START_IMAGE_URL": {
       "description": "image url for start menu",
-      "value": "https://envs.sh/Xxx.jpg"
+      "value": "https://files.catbox.moe/3vlh9i.jpg"
     }
   }
 }
