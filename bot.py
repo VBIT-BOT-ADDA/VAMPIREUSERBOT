@@ -1,9 +1,16 @@
-import asyncio
 import logging
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import os
+import re
+import asyncio
+
+from motor.motor_asyncio import AsyncIOMotorClient
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ChatType
+from telegram.error import TelegramError, RetryAfter
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -12,11 +19,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from motor.motor_asyncio import AsyncIOMotorClient
+
 from config import (
     BOT_TOKEN,
-    API_ID,
-    API_HASH,
     MONGO_DB_URI,
     OWNER_USERNAME,
     UPDATE_CHANNEL,
@@ -24,249 +29,457 @@ from config import (
     START_IMAGE_URL,
 )
 
-# Logging configuration
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("VampireUserbot")
 
-# MongoDB Database Connection
-db_client = AsyncIOMotorClient(MONGO_DB_URI)
-db = db_client["vampire_userbot_db"]
-users_collection = db["hosted_sessions"]
+mongo = AsyncIOMotorClient(MONGO_DB_URI)
+db = mongo["vampire_userbot_db"]
 
-P_EMOJI_FIRE = "🔥"
-P_EMOJI_STAR = "⭐"
-P_EMOJI_CHECK = "✅"
+warnings_db = db["warnings"]
+exempt_db = db["moderation_exemptions"]
+optin_db = db["broadcast_optin"]
+settings_db = db["chat_settings"]
 
+# Small Unicode font. Keep digits unchanged for OTPs and IDs.
 SMALL_FONT_MAP = {
-    "a": "ᵃ",
-    "b": "ᵇ",
-    "c": "ᶜ",
-    "d": "ᵈ",
-    "e": "ᵉ",
-    "f": "ᶠ",
-    "g": "ᵍ",
-    "h": "ʰ",
-    "i": "ⁱ",
-    "j": "ʲ",
-    "k": "ᵏ",
-    "l": "ˡ",
-    "m": "ᵐ",
-    "n": "ⁿ",
-    "o": "ᵒ",
-    "p": "ᵖ",
-    "q": "𐞥",
-    "r": "ʳ",
-    "s": "ˢ",
-    "t": "ᵗ",
-    "u": "ᵘ",
-    "v": "ᵛ",
-    "w": "ʷ",
-    "x": "ˣ",
-    "y": "ʸ",
-    "z": "ᶻ",
-    "0": "⁰",
-    "1": "¹",
-    "2": "²",
-    "3": "³",
-    "4": "⁴",
-    "5": "⁵",
-    "6": "⁶",
-    "7": "⁷",
-    "8": "⁸",
-    "9": "⁹",
+    "a": "ᴀ", "b": "ʙ", "c": "ᴄ", "d": "ᴅ", "e": "ᴇ",
+    "f": "ꜰ", "g": "ɢ", "h": "ʜ", "i": "ɪ", "j": "ᴊ",
+    "k": "ᴋ", "l": "ʟ", "m": "ᴍ", "n": "ɴ", "o": "ᴏ",
+    "p": "ᴘ", "q": "ǫ", "r": "ʀ", "s": "s", "t": "ᴛ",
+    "u": "ᴜ", "v": "ᴠ", "w": "ᴡ", "x": "x", "y": "ʏ",
+    "z": "ᴢ",
 }
 
 
-def to_small_font(text):
-  return "".join(SMALL_FONT_MAP.get(c.lower(), c) for c in text)
+def small(text):
+    return "".join(SMALL_FONT_MAP.get(c.lower(), c) for c in text)
 
 
-user_temp_data = {}
+def home_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👑 ᴏᴡɴᴇʀ", url=f"https://t.me/{OWNER_USERNAME.lstrip('@')}"),
+        ],
+        [
+            InlineKeyboardButton("📢 ᴜᴘᴅᴀᴛᴇs", url=UPDATE_CHANNEL),
+            InlineKeyboardButton("🛠 sᴜᴘᴘᴏʀᴛ", url=SUPPORT_GROUP),
+        ],
+        [
+            InlineKeyboardButton("📖 ʜᴇʟᴘ", callback_data="help"),
+            InlineKeyboardButton("⌨️ ᴄᴏᴍᴍᴀɴᴅs", callback_data="commands"),
+        ],
+        [
+            InlineKeyboardButton("📨 ʙʀᴏᴀᴅᴄᴀsᴛ ᴏᴘᴛ-ɪɴ", callback_data="broadcast_info"),
+        ],
+    ])
+
+
+def navigation_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 ʙᴀᴄᴋ", callback_data="home")]
+    ])
+
+
+WELCOME = (
+    "🦇 ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ᴠᴀᴍᴘɪʀᴇ ʙᴏᴛ 🦇\n\n"
+    "✨ ʏᴏᴜʀ ᴄᴏᴍᴍᴜɴɪᴛʏ, ʏᴏᴜʀ ʀᴜʟᴇs\n"
+    "🛡 ɢʀᴏᴜᴘ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ\n"
+    "⚠️ ᴡᴀʀɴɪɴɢ ᴍᴀɴᴀɢᴇᴍᴇɴᴛ\n"
+    "⚙️ ᴍᴏɴɢᴏᴅʙ sᴇᴛᴛɪɴɢs\n\n"
+    "👇 ᴄʜᴏᴏsᴇ ᴀɴ ᴏᴘᴛɪᴏɴ ʙᴇʟᴏᴡ."
+)
+
+HELP_TEXT = (
+    "📖 ʜᴇʟᴘ ᴍᴇɴᴜ\n\n"
+    "➤ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ\n"
+    "➤ ᴍᴀᴋᴇ ᴍᴇ ᴀᴅᴍɪɴ\n"
+    "➤ ᴇɴᴀʙʟᴇ ᴅᴇʟᴇᴛᴇ ᴍᴇssᴀɢᴇs ᴀɴᴅ ʙᴀɴ ᴜsᴇʀs\n\n"
+    "ᴛʜᴇ ʙᴏᴛ ᴡɪʟʟ ᴡᴀʀɴ ᴜsᴇʀs ғᴏʀ ᴍᴀᴛᴄʜɪɴɢ "
+    "ʀᴜʟᴇ-ᴠɪᴏʟᴀᴛɪɴɢ ᴛᴇxᴛ. ᴀғᴛᴇʀ 3 ᴡᴀʀɴɪɴɢs, "
+    "ɪᴛ ᴡɪʟʟ ᴀᴛᴛᴇᴍᴘᴛ ᴀ ʙᴀɴ ɪғ ᴘᴇʀᴍɪssɪᴏɴs ᴀʟʟᴏᴡ ɪᴛ."
+)
+
+COMMANDS_TEXT = (
+    "⌨️ ᴄᴏᴍᴍᴀɴᴅs\n\n"
+    "/start — ᴏᴘᴇɴ ᴍᴇɴᴜ\n"
+    "/help — ʜᴇʟᴘ\n"
+    "/commands — ᴄᴏᴍᴍᴀɴᴅ ʟɪsᴛ\n"
+    "/warnings — ᴄʜᴇᴄᴋ ʏᴏᴜʀ ᴡᴀʀɴɪɴɢs\n"
+    "/approve — ᴇxᴇᴍᴘᴛ ᴀ ʀᴇᴘʟɪᴇᴅ ᴜsᴇʀ\n"
+    "/unapprove — ʀᴇᴍᴏᴠᴇ ᴇxᴇᴍᴘᴛɪᴏɴ\n"
+    "/broadcast_optin — ᴏᴘᴛ ɪɴ ᴛᴏ ᴏᴡɴᴇʀ ᴜᴘᴅᴀᴛᴇs\n"
+    "/broadcast_optout — ᴏᴘᴛ ᴏᴜᴛ ᴏғ ᴏᴡɴᴇʀ ᴜᴘᴅᴀᴛᴇs\n\n"
+    "ᴀᴘᴘʀᴏᴠᴇ ᴀɴᴅ ᴜɴᴀᴘᴘʀᴏᴠᴇ ᴡᴏʀᴋ ᴏɴ ᴀ ʀᴇᴘʟɪᴇᴅ "
+    "ᴍᴇssᴀɢᴇ ɪɴ ᴀ ɢʀᴏᴜᴘ."
+)
+
+BROADCAST_INFO = (
+    "📨 ʙʀᴏᴀᴅᴄᴀsᴛ ᴘʀɪᴠᴀᴄʏ\n\n"
+    "ᴜsᴇ /broadcast_optin ɪɴ ᴘʀɪᴠᴀᴛᴇ ᴛᴏ ʀᴇᴄᴇɪᴠᴇ "
+    "ᴜᴘᴅᴀᴛᴇs ғʀᴏᴍ ᴛʜᴇ ʙᴏᴛ ᴏᴡɴᴇʀ.\n"
+    "ᴜsᴇ /broadcast_optout ᴀɴʏᴛɪᴍᴇ ᴛᴏ sᴛᴏᴘ.\n"
+    "ᴏɴʟʏ ᴜsᴇʀs ᴡʜᴏ ᴏᴘᴛᴇᴅ ɪɴ ᴡɪʟʟ ʀᴇᴄᴇɪᴠᴇ "
+    "ᴍᴇssᴀɢᴇs."
+)
+
+# Starter text filters only. Review and customize these words for your group.
+# Keyword matching is not a reliable way to determine whether content is pornographic.
+BAD_WORDS = {
+    "fuck", "fucking", "motherfucker",
+    "bitch", "bastard", "asshole",
+}
+
+# Keep the list small and avoid matching harmless words accidentally.
+BAD_PATTERNS = [
+    re.compile(r"\bpornography\b", re.IGNORECASE),
+    re.compile(r"\bporn\b", re.IGNORECASE),
+    re.compile(r"\bxxx\b", re.IGNORECASE),
+    re.compile(r"\bsex\s*video\b", re.IGNORECASE),
+    *[
+        re.compile(rf"\b{re.escape(word)}\b", re.IGNORECASE)
+        for word in BAD_WORDS
+    ],
+]
+
+
+def violates_rules(text):
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in BAD_PATTERNS)
+
+
+async def is_group_admin(context, chat_id, user_id):
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator", "owner")
+    except TelegramError:
+        return False
+
+
+async def show_home(message, context):
+    try:
+        await message.reply_photo(
+            photo=START_IMAGE_URL,
+            caption=WELCOME,
+            reply_markup=home_keyboard(),
+        )
+    except Exception:
+        await message.reply_text(WELCOME, reply_markup=home_keyboard())
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-  keyboard = [
-      [InlineKeyboardButton("👑 owner profile", url=f"https://t.me/{OWNER_USERNAME}")],
-      [
-          InlineKeyboardButton("📢 update channel", url=UPDATE_CHANNEL),
-          InlineKeyboardButton("🛠️ support group", url=SUPPORT_GROUP),
-      ],
-      [InlineKeyboardButton("🚀 click to host userbot", callback_data="click_to_host")],
-  ]
-  reply_markup = InlineKeyboardMarkup(keyboard)
+    if update.effective_message:
+        await show_home(update.effective_message, context)
 
-  welcome_text = (
-      f"{P_EMOJI_STAR} {to_small_font('welcome to premium userbot hosting bot')} {P_EMOJI_STAR}\n\n"
-      f"{to_small_font('click the primary button below to host your bot safely & securely with mongodb support.')}"
-  )
 
-  if update.message:
-    try:
-      await update.message.reply_photo(
-          photo=START_IMAGE_URL, caption=welcome_text, reply_markup=reply_markup
-      )
-    except Exception:
-      await update.message.reply_text(text=welcome_text, reply_markup=reply_markup)
-  elif update.callback_query:
-    query = update.callback_query
-    await query.answer()
-    try:
-      await query.message.edit_caption(caption=welcome_text, reply_markup=reply_markup)
-    except Exception:
-      try:
-        await query.edit_message_text(text=welcome_text, reply_markup=reply_markup)
-      except Exception:
-        pass
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        HELP_TEXT, reply_markup=navigation_keyboard()
+    )
+
+
+async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        COMMANDS_TEXT, reply_markup=navigation_keyboard()
+    )
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-  query = update.callback_query
-  await query.answer()
+    query = update.callback_query
+    await query.answer()
 
-  if query.data == "click_to_host":
-    user_temp_data[query.from_user.id] = {"step": "waiting_phone"}
-    prompt_text = f"{to_small_font('📱 please send your telegram phone number with country code (e.g., +919876543210):')}"
+    if query.data == "home":
+        try:
+            await query.message.edit_caption(
+                caption=WELCOME, reply_markup=home_keyboard()
+            )
+        except TelegramError:
+            try:
+                await query.message.edit_text(
+                    WELCOME, reply_markup=home_keyboard()
+                )
+            except TelegramError:
+                pass
+
+    elif query.data in ("help", "commands", "broadcast_info"):
+        text = {
+            "help": HELP_TEXT,
+            "commands": COMMANDS_TEXT,
+            "broadcast_info": BROADCAST_INFO,
+        }[query.data]
+
+        try:
+            await query.message.edit_caption(
+                caption=text, reply_markup=navigation_keyboard()
+            )
+        except TelegramError:
+            try:
+                await query.message.edit_text(
+                    text, reply_markup=navigation_keyboard()
+                )
+            except TelegramError:
+                pass
+
+
+async def warnings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if chat.type == ChatType.PRIVATE:
+        await update.effective_message.reply_text(
+            "ᴜsᴇ /warnings ɪɴ ᴛʜᴇ ɢʀᴏᴜᴘ ᴡʜᴇʀᴇ ʏᴏᴜ ᴡᴀɴᴛ "
+            "ᴛᴏ ᴄʜᴇᴄᴋ ʏᴏᴜʀ ᴡᴀʀɴɪɴɢs."
+        )
+        return
+
+    record = await warnings_db.find_one({
+        "chat_id": chat.id,
+        "user_id": user.id,
+    })
+    count = record.get("count", 0) if record else 0
+
+    await update.effective_message.reply_text(
+        f"⚠️ {user.first_name}: {count}/3 ᴡᴀʀɴɪɴɢs"
+    )
+
+
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+    caller = update.effective_user
+
+    if chat.type == ChatType.PRIVATE:
+        await message.reply_text(
+            "ᴜsᴇ /approve ᴀs ᴀ ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴜsᴇʀ's ᴍᴇssᴀɢᴇ ɪɴ ᴀ ɢʀᴏᴜᴘ."
+        )
+        return
+
+    if not await is_group_admin(context, chat.id, caller.id):
+        await message.reply_text("❌ ᴏɴʟʏ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴄᴀɴ ᴜsᴇ ᴛʜɪs.")
+        return
+
+    if not message.reply_to_message:
+        await message.reply_text("ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴜsᴇʀ's ᴍᴇssᴀɢᴇ ᴛᴏ ᴀᴘᴘʀᴏᴠᴇ ᴛʜᴇᴍ.")
+        return
+
+    target = message.reply_to_message.from_user
+    if target.is_bot:
+        await message.reply_text("ʙᴏᴛs ᴅᴏ ɴᴏᴛ ɴᴇᴇᴅ ᴇxᴇᴍᴘᴛɪᴏɴs.")
+        return
+
+    await exempt_db.update_one(
+        {"chat_id": chat.id, "user_id": target.id},
+        {"$set": {"approved_by": caller.id}},
+        upsert=True,
+    )
+    await message.reply_text(
+        f"✅ {target.first_name} ɪs ɴᴏᴡ ᴇxᴇᴍᴘᴛ ғʀᴏᴍ ᴛᴇxᴛ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ."
+    )
+
+
+async def unapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+    caller = update.effective_user
+
+    if chat.type == ChatType.PRIVATE:
+        await message.reply_text("ᴛʜɪs ᴄᴏᴍᴍᴀɴᴅ ᴡᴏʀᴋs ɪɴ ɢʀᴏᴜᴘs.")
+        return
+
+    if not await is_group_admin(context, chat.id, caller.id):
+        await message.reply_text("❌ ᴏɴʟʏ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴄᴀɴ ᴜsᴇ ᴛʜɪs.")
+        return
+
+    if not message.reply_to_message:
+        await message.reply_text("ʀᴇᴘʟʏ ᴛᴏ ᴛʜᴇ ᴜsᴇʀ's ᴍᴇssᴀɢᴇ.")
+        return
+
+    target = message.reply_to_message.from_user
+    await exempt_db.delete_one({"chat_id": chat.id, "user_id": target.id})
+    await message.reply_text(
+        f"✅ ᴇxᴇᴍᴘᴛɪᴏɴ ʀᴇᴍᴏᴠᴇᴅ ғᴏʀ {target.first_name}."
+    )
+
+
+async def broadcast_optin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text(
+            "ᴘʟᴇᴀsᴇ ᴜsᴇ ᴛʜɪs ᴄᴏᴍᴍᴀɴᴅ ɪɴ ᴘʀɪᴠᴀᴛᴇ."
+        )
+        return
+
+    await optin_db.update_one(
+        {"user_id": user.id},
+        {"$set": {"opted_in": True}},
+        upsert=True,
+    )
+    await update.effective_message.reply_text(
+        "✅ ʏᴏᴜ ᴀʀᴇ ᴏᴘᴛᴇᴅ ɪɴ ᴛᴏ ᴏᴡɴᴇʀ ᴜᴘᴅᴀᴛᴇs. "
+        "ᴜsᴇ /broadcast_optout ᴀɴʏᴛɪᴍᴇ ᴛᴏ ᴏᴘᴛ ᴏᴜᴛ."
+    )
+
+
+async def broadcast_optout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await optin_db.delete_one({"user_id": update.effective_user.id})
+    await update.effective_message.reply_text(
+        "✅ ʏᴏᴜ ʜᴀᴠᴇ ᴏᴘᴛᴇᴅ ᴏᴜᴛ ᴏғ ᴏᴡɴᴇʀ ᴜᴘᴅᴀᴛᴇs."
+    )
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /broadcast your message. Only opted-in users receive it."""
+    user = update.effective_user
+    owner = OWNER_USERNAME.lstrip("@").lower()
+
+    if not user.username or user.username.lower() != owner:
+        await update.effective_message.reply_text("❌ ᴏᴡɴᴇʀ ᴏɴʟʏ.")
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "ᴜsᴀɢᴇ: /broadcast ʏᴏᴜʀ ᴍᴇssᴀɢᴇ"
+        )
+        return
+
+    body = " ".join(context.args)
+    cursor = optin_db.find({"opted_in": True})
+    sent = 0
+    failed = 0
+
+    async for record in cursor:
+        try:
+            await context.bot.send_message(
+                chat_id=record["user_id"],
+                text=body,
+            )
+            sent += 1
+            await asyncio.sleep(0.08)
+        except RetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 1)
+            try:
+                await context.bot.send_message(
+                    chat_id=record["user_id"], text=body
+                )
+                sent += 1
+            except TelegramError:
+                failed += 1
+        except TelegramError:
+            failed += 1
+
+    await update.effective_message.reply_text(
+        f"📨 ʙʀᴏᴀᴅᴄᴀsᴛ ᴄᴏᴍᴘʟᴇᴛᴇ\n"
+        f"✅ sᴇɴᴛ: {sent}\n❌ ғᴀɪʟᴇᴅ: {failed}"
+    )
+
+
+async def moderate_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not user or user.is_bot:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    # Do not moderate group administrators.
+    if await is_group_admin(context, chat.id, user.id):
+        return
+
+    # Explicit per-group exemption.
+    if await exempt_db.find_one({"chat_id": chat.id, "user_id": user.id}):
+        return
+
+    text = message.text or message.caption or ""
+    if not violates_rules(text):
+        return
+
+    # Delete the matching message if the bot has permission.
     try:
-      await query.message.edit_caption(caption=prompt_text)
-    except Exception:
-      try:
-        await query.edit_message_text(text=prompt_text)
-      except Exception:
-        pass
+        await message.delete()
+    except TelegramError:
+        logger.warning("Cannot delete message in chat %s", chat.id)
 
+    key = {"chat_id": chat.id, "user_id": user.id}
+    record = await warnings_db.find_one_and_update(
+        key,
+        {"$inc": {"count": 1}},
+        upsert=True,
+        return_document=True,
+    )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-  if not update.message or not update.message.text:
-    return
+    count = min(record.get("count", 1), 3)
 
-  user_id = update.message.from_user.id
-  text = update.message.text.strip()
-
-  if user_id not in user_temp_data:
-    return
-
-  current_step = user_temp_data[user_id].get("step")
-
-  if current_step == "waiting_phone":
-    phone = text
-    user_temp_data[user_id]["phone"] = phone
-    user_temp_data[user_id]["step"] = "waiting_otp"
+    if count < 3:
+        await message.reply_text(
+            f"⚠️ {user.first_name}, ᴡᴀʀɴɪɴɢ {count}/3\n\n"
+            "ᴘᴏʀɴᴏɢʀᴀᴘʜʏ ᴀɴᴅ ᴀʙᴜsɪᴠᴇ ʟᴀɴɢᴜᴀɢᴇ ᴀʀᴇ ɴᴏᴛ "
+            "ᴀʟʟᴏᴡᴇᴅ ʜᴇʀᴇ. ᴘʟᴇᴀsᴇ sᴛᴏᴘ."
+        )
+        return
 
     try:
-      client = TelegramClient(StringSession(), API_ID, API_HASH)
-      await client.connect()
-      sent_code = await client.send_code_request(phone)
-      user_temp_data[user_id]["client"] = client
-      user_temp_data[user_id]["phone_code_hash"] = sent_code.phone_code_hash
+        await context.bot.ban_chat_member(
+            chat_id=chat.id,
+            user_id=user.id,
+        )
+        await message.reply_text(
+            f"⛔ {user.first_name} ʀᴇᴀᴄʜᴇᴅ 3 ᴡᴀʀɴɪɴɢs ᴀɴᴅ ᴡᴀs ʙᴀɴɴᴇᴅ."
+        )
+    except TelegramError as exc:
+        logger.warning("Ban failed for %s in %s: %s", user.id, chat.id, exc)
+        await message.reply_text(
+            f"⚠️ {user.first_name} ʀᴇᴀᴄʜᴇᴅ 3 ᴡᴀʀɴɪɴɢs, "
+            "ʙᴜᴛ ɪ ᴄᴏᴜʟᴅ ɴᴏᴛ ʙᴀɴ ᴛʜᴇᴍ. "
+            "ᴄʜᴇᴄᴋ ᴍʏ ᴀᴅᴍɪɴ ᴘᴇʀᴍɪssɪᴏɴs."
+        )
 
-      await update.message.reply_text(
-          text=f"{P_EMOJI_CHECK} {to_small_font('otp sent successfully!')}\n"
-          f"{to_small_font('please enter your otp with spaces (example: 1 2 3 4 5):')}"
-      )
-    except Exception as e:
-      await update.message.reply_text(
-          text=f"{to_small_font(f'❌ error: {str(e)}')}\n"
-          f"{to_small_font('please restart using /start')}"
-      )
-      user_temp_data.pop(user_id, None)
 
-  elif current_step == "waiting_otp":
-    otp = text.replace(" ", "")
-    client = user_temp_data[user_id]["client"]
-    phone = user_temp_data[user_id]["phone"]
-    phone_code_hash = user_temp_data[user_id]["phone_code_hash"]
-
-    try:
-      await client.sign_in(phone, otp, phone_code_hash=phone_code_hash)
-      string_session = client.session.save()
-
-      await users_collection.update_one(
-          {"user_id": user_id},
-          {"$set": {"session": string_session, "phone": phone}},
-          upsert=True,
-      )
-
-      await update.message.reply_text(
-          text=f"{P_EMOJI_FIRE} {to_small_font('login successful & saved in database!')}\n"
-          f"{to_small_font('your string session is active and securely stored:')}\n\n"
-          f"`{string_session}`"
-      )
-      user_temp_data.pop(user_id, None)
-      await client.disconnect()
-
-    except SessionPasswordNeededError:
-      user_temp_data[user_id]["step"] = "waiting_password"
-      await update.message.reply_text(
-          text=f"{to_small_font('🔒 2-step verification detected!')}\n"
-          f"{to_small_font('please enter your cloud password:')}"
-      )
-    except Exception as e:
-      await update.message.reply_text(
-          text=f"{to_small_font(f'❌ login failed: {str(e)}')}\n"
-          f"{to_small_font('please restart using /start')}"
-      )
-      user_temp_data.pop(user_id, None)
-
-  elif current_step == "waiting_password":
-    password = text
-    client = user_temp_data[user_id]["client"]
-
-    try:
-      await client.sign_in(password=password)
-      string_session = client.session.save()
-
-      await users_collection.update_one(
-          {"user_id": user_id},
-          {
-              "$set": {
-                  "session": string_session,
-                  "phone": user_temp_data[user_id]["phone"],
-              }
-          },
-          upsert=True,
-      )
-
-      await update.message.reply_text(
-          text=f"{P_EMOJI_FIRE} {to_small_font('2-step login successful & saved!')}\n"
-          f"{to_small_font('your string session is securely stored in database:')}\n\n"
-          f"`{string_session}`"
-      )
-      user_temp_data.pop(user_id, None)
-      await client.disconnect()
-
-    except Exception as e:
-      await update.message.reply_text(
-          text=f"{to_small_font(f'❌ wrong password: {str(e)}')}\n"
-          f"{to_small_font('please restart using /start')}"
-      )
-      user_temp_data.pop(user_id, None)
+async def error_handler(update, context):
+    logger.error("Update failed", exc_info=context.error)
 
 
 def main():
-  # Added connection timeouts to prevent TimedOut crash errors on Heroku
-  app = (
-      ApplicationBuilder()
-      .token(BOT_TOKEN)
-      .connect_timeout(30.0)
-      .read_timeout(30.0)
-      .write_timeout(30.0)
-      .build()
-  )
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
 
-  app.add_handler(CommandHandler("start", start))
-  app.add_handler(CallbackQueryHandler(button_handler))
-  app.add_handler(
-      MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
-  )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("commands", commands_command))
+    app.add_handler(CommandHandler("warnings", warnings_command))
+    app.add_handler(CommandHandler("approve", approve_command))
+    app.add_handler(CommandHandler("unapprove", unapprove_command))
+    app.add_handler(CommandHandler("broadcast_optin", broadcast_optin))
+    app.add_handler(CommandHandler("broadcast_optout", broadcast_optout))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
-  logger.info("bot started successfully with mongodb and timeout fix...")
-  print("bot started successfully with mongodb and timeout fix...")
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.CAPTION)
+            & ~filters.COMMAND
+            & filters.ChatType.GROUPS,
+            moderate_message,
+        )
+    )
 
-  app.run_polling()
+    app.add_error_handler(error_handler)
+    logger.info("Vampire moderation bot starting")
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
-  main()
+    main()
