@@ -1,43 +1,40 @@
-import os
 import asyncio
 import logging
 import random
 
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import MemorySession
+
 from config import (
-    BOT_TOKEN,
-    API_ID,
     API_HASH,
+    API_ID,
+    BOT_TOKEN,
     MONGO_DB_URI,
     OWNER_USERNAME,
-    UPDATE_CHANNEL,
-    SUPPORT_GROUP,
     START_IMAGE_URL,
+    SUPPORT_GROUP,
+    UPDATE_CHANNEL,
 )
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("VampireUserbot")
 
 # MongoDB Database Connection
 mongo = AsyncIOMotorClient(MONGO_DB_URI)
 db = mongo["vampire_userbot_db"]
 opted_in = db["tag_optin"]
-users_collection = db["hosted_sessions"]
+sessions_collection = db["hosted_sessions"]
 
 P_EMOJI_FIRE = "🔥"
 P_EMOJI_STAR = "⭐"
@@ -126,7 +123,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
   welcome_text = (
       f"{P_EMOJI_STAR} {to_small_font('welcome to vampire userbot hosting bot')} {P_EMOJI_STAR}\n\n"
-      f"{to_small_font('click the button below to host your userbot securely with mongodb support.')}"
+      f"{to_small_font('click the button below to host your userbot directly on your account.')}"
   )
 
   if update.message:
@@ -182,10 +179,11 @@ async def handle_hosting_messages(update: Update, context: ContextTypes.DEFAULT_
     user_temp_data[user_id]["step"] = "waiting_otp"
 
     try:
-      client = TelegramClient(StringSession(), API_ID, API_HASH)
-      await client.connect()
-      sent_code = await client.send_code_request(phone)
-      user_temp_data[user_id]["client"] = client
+      # Use MemorySession temporarily during login process
+      client_temp = TelegramClient(MemorySession(), API_ID, API_HASH)
+      await client_temp.connect()
+      sent_code = await client_temp.send_code_request(phone)
+      user_temp_data[user_id]["client"] = client_temp
       user_temp_data[user_id]["phone_code_hash"] = sent_code.phone_code_hash
 
       await update.message.reply_text(
@@ -201,27 +199,31 @@ async def handle_hosting_messages(update: Update, context: ContextTypes.DEFAULT_
 
   elif current_step == "waiting_otp":
     otp = text.replace(" ", "")
-    client = user_temp_data[user_id]["client"]
+    client_temp = user_temp_data[user_id]["client"]
     phone = user_temp_data[user_id]["phone"]
     phone_code_hash = user_temp_data[user_id]["phone_code_hash"]
 
     try:
-      await client.sign_in(phone, otp, phone_code_hash=phone_code_hash)
-      string_session = client.session.save()
+      await client_temp.sign_in(phone, otp, phone_code_hash=phone_code_hash)
+      
+      # Extract raw session bytes / session data to store in MongoDB securely without strings
+      session_data = client_temp.session.save()
 
-      await users_collection.update_one(
+      # Save session into MongoDB mapped to user_id
+      await sessions_collection.update_one(
           {"user_id": user_id},
-          {"$set": {"session": string_session, "phone": phone}},
+          {"$set": {"session": session_data, "phone": phone}},
           upsert=True,
       )
 
       await update.message.reply_text(
-          text=f"{P_EMOJI_FIRE} {to_small_font('login successful & saved in database!')}\n"
-          f"{to_small_font('your string session is active and securely stored:')}\n\n"
-          f"`{string_session}`"
+          text=f"{P_EMOJI_FIRE} {to_small_font('login successful & userbot activated!')}\n"
+          f"{to_small_font('your account is now successfully hosted and running.')}"
       )
+      
+      # Keep reference and start background userbot instance
+      asyncio.create_task(run_active_userbot(client_temp, user_id))
       user_temp_data.pop(user_id, None)
-      await client.disconnect()
 
     except SessionPasswordNeededError:
       user_temp_data[user_id]["step"] = "waiting_password"
@@ -238,17 +240,18 @@ async def handle_hosting_messages(update: Update, context: ContextTypes.DEFAULT_
 
   elif current_step == "waiting_password":
     password = text
-    client = user_temp_data[user_id]["client"]
+    client_temp = user_temp_data[user_id]["client"]
 
     try:
-      await client.sign_in(password=password)
-      string_session = client.session.save()
+      await client_temp.sign_in(password=password)
+      session_data = client_temp.session.save()
 
-      await users_collection.update_one(
+      # Save 2-step session securely into MongoDB
+      await sessions_collection.update_one(
           {"user_id": user_id},
           {
               "$set": {
-                  "session": string_session,
+                  "session": session_data,
                   "phone": user_temp_data[user_id]["phone"],
               }
           },
@@ -256,12 +259,13 @@ async def handle_hosting_messages(update: Update, context: ContextTypes.DEFAULT_
       )
 
       await update.message.reply_text(
-          text=f"{P_EMOJI_FIRE} {to_small_font('2-step login successful & saved!')}\n"
-          f"{to_small_font('your string session is securely stored in database:')}\n\n"
-          f"`{string_session}`"
+          text=f"{P_EMOJI_FIRE} {to_small_font('2-step login successful & userbot activated!')}\n"
+          f"{to_small_font('your account is now successfully hosted and running.')}"
       )
+      
+      # Keep reference and start background userbot instance
+      asyncio.create_task(run_active_userbot(client_temp, user_id))
       user_temp_data.pop(user_id, None)
-      await client.disconnect()
 
     except Exception as e:
       await update.message.reply_text(
@@ -271,9 +275,7 @@ async def handle_hosting_messages(update: Update, context: ContextTypes.DEFAULT_
       user_temp_data.pop(user_id, None)
 
 
-# --- Userbot Commands ---
-# Note: To run the active userbot client instance along with python-telegram-bot,
-# we register event handlers.
+# --- Userbot Core Event Handlers ---
 def register_userbot_events(ubot_client):
 
   @ubot_client.on(events.NewMessage(pattern=r"^\.help$"))
@@ -313,7 +315,7 @@ def register_userbot_events(ubot_client):
         await event.reply("❌ ɢʀᴏᴜᴘ ᴀᴅᴍɪɴs ᴏɴʟʏ.")
         return
     except Exception:
-      await event.reply("ᴄᴏᴜʟᴅ ɴᴏᴛ ᴠᴇʀɪғʏ ᴀᴅᴍɪɴ pᴇʀᴍɪssɪᴏɴs.")
+      await event.reply("ᴄᴏᴜʟᴅ ɴᴏᴛ ᴠᴇʀɪғʏ ᴀᴅᴍɪɴ ᴘᴇʀᴍɪssɪᴏɴs.")
       return
 
     custom_message = event.pattern_match.group(1) or "Hello!"
@@ -357,7 +359,7 @@ def register_userbot_events(ubot_client):
     }).to_list(length=1000)
 
     if not records:
-      await event.reply("ɴᴏ ᴍᴇᴍʙᴇʀs ʜᴀᴠᴇ ᴏᴘᴛᴇᴅ ɪɴ.")
+      await event.reply("ɴᴏ ᴍᴇᴍʙᴇʀs ʜᴀᴠᴇ ᴏᴘᴛᴇ_ɪɴ.")
       return
 
     record = random.choice(records)
@@ -369,6 +371,33 @@ def register_userbot_events(ubot_client):
       )
     except Exception:
       await event.reply("ᴄᴏᴜʟᴅ ɴᴏᴛ ᴛᴀɢ ᴛʜɪs ᴍᴇᴍʙᴇʀ.")
+
+
+async def run_active_userbot(ubot_client, user_id):
+  try:
+    register_userbot_events(ubot_client)
+    if not ubot_client.is_connected():
+      await ubot_client.connect()
+    me = await ubot_client.get_me()
+    log.info("Userbot active & running for: %s (%s)", me.first_name, me.id)
+    await ubot_client.run_until_disconnected()
+  except Exception as e:
+    log.error("Userbot disconnected for user %s due to: %s", user_id, e)
+
+
+async def restart_saved_sessions():
+  async for doc in sessions_collection.find({}):
+    if "session" in doc:
+      try:
+        # Load session back from database storage
+        session_data = doc["session"]
+        session_obj = MemorySession()
+        session_obj.load_session(session_data)
+        
+        ubot_client = TelegramClient(session_obj, API_ID, API_HASH)
+        asyncio.create_task(run_active_userbot(ubot_client, doc["user_id"]))
+      except Exception as e:
+        log.error("Failed to restart hosted session for user: %s", e)
 
 
 async def main():
@@ -394,6 +423,9 @@ async def main():
 
   log.info("bot started successfully with click-to-host and mongodb support...")
   print("bot started successfully with click-to-host and mongodb support...")
+
+  # 2. Restart all existing userbot sessions saved in database automatically on boot
+  await restart_saved_sessions()
 
   # Keep running forever
   await asyncio.Event().wait()
