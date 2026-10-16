@@ -12,10 +12,12 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from motor.motor_asyncio import AsyncIOMotorClient
 from config import (
     BOT_TOKEN,
     API_ID,
     API_HASH,
+    MONGO_DB_URI,
     OWNER_USERNAME,
     UPDATE_CHANNEL,
     SUPPORT_GROUP,
@@ -28,6 +30,11 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# MongoDB Database Connection
+db_client = AsyncIOMotorClient(MONGO_DB_URI)
+db = db_client["vampire_userbot_db"]
+users_collection = db["hosted_sessions"]
 
 P_EMOJI_FIRE = "🔥"
 P_EMOJI_STAR = "⭐"
@@ -93,7 +100,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
   welcome_text = (
       f"{P_EMOJI_STAR} {to_small_font('welcome to premium userbot hosting bot')} {P_EMOJI_STAR}\n\n"
-      f"{to_small_font('click the primary button below to host your bot safely & securely.')}"
+      f"{to_small_font('click the primary button below to host your bot safely & securely with mongodb support.')}"
   )
 
   if update.message:
@@ -164,9 +171,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
       await client.sign_in(phone, otp, phone_code_hash=phone_code_hash)
       string_session = client.session.save()
 
+      # Save session securely into MongoDB
+      await users_collection.update_one(
+          {"user_id": user_id},
+          {"$set": {"session": string_session, "phone": phone}},
+          upsert=True,
+      )
+
       await update.message.reply_text(
-          text=f"{P_EMOJI_FIRE} {to_small_font('login successful!')}\n"
-          f"{to_small_font('string session generated. your userbot is active:')}\n\n"
+          text=f"{P_EMOJI_FIRE} {to_small_font('login successful & saved in database!')}\n"
+          f"{to_small_font('your string session is active and securely stored:')}\n\n"
           f"`{string_session}`"
       )
       user_temp_data.pop(user_id, None)
@@ -193,9 +207,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
       await client.sign_in(password=password)
       string_session = client.session.save()
 
+      # Save 2-step session securely into MongoDB
+      await users_collection.update_one(
+          {"user_id": user_id},
+          {
+              "$set": {
+                  "session": string_session,
+                  "phone": user_temp_data[user_id]["phone"],
+              }
+          },
+          upsert=True,
+      )
+
       await update.message.reply_text(
-          text=f"{P_EMOJI_FIRE} {to_small_font('2-step login successful!')}\n"
-          f"{to_small_font('string session generated successfully:')}\n\n"
+          text=f"{P_EMOJI_FIRE} {to_small_font('2-step login successful & saved!')}\n"
+          f"{to_small_font('your string session is securely stored in database:')}\n\n"
           f"`{string_session}`"
       )
       user_temp_data.pop(user_id, None)
@@ -203,7 +229,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
       await update.message.reply_text(
-          text=f"{to_small_font(f'❌ wrong password: {str(e)}')}\n"
+          text=f"{to_small_files if 'To_small_files' in globals() else to_small_font}(f'❌ wrong password: {str(e)}')\n"
           f"{to_small_font('please restart using /start')}"
       )
       user_temp_data.pop(user_id, None)
@@ -217,7 +243,7 @@ def main():
       MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
   )
 
-  logger.info("bot started successfully...")
+  logger.info("bot started successfully with mongodb support...")
   print("bot started successfully...")
 
   app.run_polling()
@@ -225,4 +251,4 @@ def main():
 
 if __name__ == "__main__":
   main()
-  
+    
