@@ -1,0 +1,37 @@
+{
+  "name": "telegram userbot host bot",
+  "description": "a telegram bot to host userbots securely with session generation.",
+  "repository": "https://github.com/your-username/your-repo",
+  "keywords": ["telegram", "userbot", "hosting", "telethon"],
+  "stack": "container",
+  "env": {
+    "BOT_TOKEN": {
+      "description": "your telegram bot token from botfather",
+      "value": ""
+    },
+    "API_ID": {
+      "description": "your telegram api id from my.telegram.org",
+      "value": ""
+    },
+    "API_HASH": {
+      "description": "your telegram api hash from my.telegram.org",
+      "value": ""
+    },
+    "OWNER_USERNAME": {
+      "description": "your telegram username without @",
+      "value": "YourUsername"
+    },
+    "UPDATE_CHANNEL": {
+      "description": "your update channel link",
+      "value": "https://t.me/YourUpdateChannel"
+    },
+    "SUPPORT_GROUP": {
+      "description": "your support group link",
+      "value": "https://t.me/YourSupportGroup"
+    },
+    "START_IMAGE_URL": {
+      "description": "image url for start menu",
+      "value": "https://envs.sh/Xxx.jpg"
+    }
+  }
+}
