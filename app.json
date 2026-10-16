@@ -3,7 +3,11 @@
   "description": "a telegram bot to host userbots securely with mongodb database support.",
   "repository": "https://github.com/VBIT-BOT-ADDA/VAMPIREUSERBOT",
   "keywords": ["telegram", "userbot", "hosting", "telethon", "mongodb"],
-  "stack": "container",
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
   "env": {
     "BOT_TOKEN": {
       "description": "your telegram bot token from botfather",
